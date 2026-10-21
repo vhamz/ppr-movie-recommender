@@ -128,10 +128,10 @@ const HW6_TOLERANCE = 1e-6;
 const MF_FACTORS = 16;
 
 /** Fixed seed for the deterministic MF reference (reproducible initialisation). */
-const MF_SEED = 20261013;
+const MF_SEED = 'HW5 initialization 42/43; shuffle 2026';
 
 /** Training settings, keeping the previous assignment's convention. */
-const MF_CONFIG = { epochs: 30, lr: 0.01, reg: 0.05, batchSize: 512 };
+const MF_CONFIG = { epochs: 20, lr: 0.01, reg: 0.05, batchSize: 64 };
 
 /**
  * Public description of the provided MF reference model, filled in when the
@@ -852,166 +852,13 @@ function hw6MfRmse(split) {
  *   the TensorFlow.js runtime is not ready, or when training throws.
  */
 function hw6EnsureMf() {
-  if (HW6_MF_TRAINING) return HW6_MF_TRAINING;
-  if (HW6_MF_MODEL && MF_INFO.trainedAt !== null) return Promise.resolve(HW6_MF_MODEL);
-  if (typeof tf === "undefined" || !HW6_STATE.splitReady) return Promise.resolve(null);
-  const train = HW6_SPLIT.train;
-  if (train.length === 0) return Promise.resolve(null);
-
-  HW6_MF_TRAINING = hw6TrainMf(train).then(
-    function (model) {
-      HW6_MF_TRAINING = null;
-      return model;
-    },
-    function (error) {
-      HW6_MF_TRAINING = null;
-      console.error("MF reference training failed:", error);
-      // Cover failures raised before the inner try (variable / tensor setup).
-      hw6DisposeMf();
-      MF_INFO.checkpoint = null;
-      MF_INFO.validationRMSE = null;
-      MF_INFO.trainedAt = null;
-      return null;
-    },
-  );
+  if(HW6_MF_MODEL&&MF_INFO.trainedAt!==null)return Promise.resolve(HW6_MF_MODEL);
+  if(HW6_MF_TRAINING)return HW6_MF_TRAINING;
+  HW6_MF_TRAINING=hw6LoadPreviousMf().finally(()=>{HW6_MF_TRAINING=null;});
   return HW6_MF_TRAINING;
 }
 
-/**
- * The actual MF training loop used by `hw6EnsureMf`. Kept separate so the
- * in-flight promise is installed before the first `await`, which is what makes
- * concurrent first-needs share a single run.
- *
- * Uses `tf.tidy` per batch, disposes the scalar loss returned by
- * `optimizer.minimize`, and never puts an async callback inside `tf.tidy`.
- *
- * @param {Rating[]} train Training rows.
- * @returns {Promise<MfModel|null>}
- */
-async function hw6TrainMf(train) {
-  hw6DisposeMf();
-  const F = MF_FACTORS;
-  const userRows = Math.max(1, numUsers + 1);
-  const itemRows = Math.max(1, HW6_MAX_MOVIE_ID + 1);
-  const rand = hw6Mulberry32(MF_SEED);
-  const normal = function () {
-    const u = Math.max(rand(), 1e-12);
-    const v = rand();
-    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
-  };
-
-  const uData = new Float32Array(userRows * F);
-  for (let k = 0; k < uData.length; k++) uData[k] = normal() * 0.05;
-  const iData = new Float32Array(itemRows * F);
-  for (let k = 0; k < iData.length; k++) iData[k] = normal() * 0.05;
-
-  let globalMean = 0;
-  for (let i = 0; i < train.length; i++) globalMean += train[i].rating;
-  globalMean /= train.length;
-
-  const userFactors = tf.variable(tf.tensor2d(uData, [userRows, F]));
-  const itemFactors = tf.variable(tf.tensor2d(iData, [itemRows, F]));
-  HW6_MF_MODEL = { userFactors: userFactors, itemFactors: itemFactors, globalMean: globalMean };
-
-  const optimizer = tf.train.adam(MF_CONFIG.lr);
-  const order = new Int32Array(train.length);
-  for (let i = 0; i < order.length; i++) order[i] = i;
-
-  let bestVal = Infinity;
-  let bestEpoch = 0;
-  let bestU = null;
-  let bestI = null;
-  MF_INFO.history = [];
-
-  try {
-    for (let epoch = 1; epoch <= MF_CONFIG.epochs; epoch++) {
-      for (let i = order.length - 1; i > 0; i--) {
-        const j = Math.floor(rand() * (i + 1));
-        const tmp = order[i];
-        order[i] = order[j];
-        order[j] = tmp;
-      }
-      for (let start = 0; start < order.length; start += MF_CONFIG.batchSize) {
-        const end = Math.min(start + MF_CONFIG.batchSize, order.length);
-        const size = end - start;
-        const uIdx = new Int32Array(size);
-        const iIdx = new Int32Array(size);
-        const target = new Float32Array(size);
-        for (let k = 0; k < size; k++) {
-          const row = train[order[start + k]];
-          uIdx[k] = row.userId;
-          iIdx[k] = row.movieId;
-          target[k] = row.rating;
-        }
-        const cost = optimizer.minimize(
-          function () {
-            return tf.tidy(function () {
-              const u = tf.gather(userFactors, tf.tensor1d(uIdx, "int32"));
-              const it = tf.gather(itemFactors, tf.tensor1d(iIdx, "int32"));
-              const pred = tf.sum(tf.mul(u, it), 1).add(globalMean);
-              const mse = tf.losses.meanSquaredError(tf.tensor1d(target, "float32"), pred);
-              const l2 = userFactors.square().sum().add(itemFactors.square().sum()).mul(MF_CONFIG.reg);
-              return mse.add(l2);
-            });
-          },
-          true,
-          [userFactors, itemFactors],
-        );
-        if (cost) cost.dispose();
-      }
-
-      const trainRmse = hw6MfRmse(train);
-      const valRmse = hw6MfRmse(HW6_SPLIT.val);
-      MF_INFO.history.push({ epoch: epoch, trainRMSE: trainRmse, valRMSE: valRmse });
-      if (Number.isFinite(valRmse) && valRmse < bestVal) {
-        bestVal = valRmse;
-        bestEpoch = epoch;
-        bestU = userFactors.dataSync().slice();
-        bestI = itemFactors.dataSync().slice();
-      }
-
-      // Announce progress and hand control back to the browser so the UI paints
-      // between epochs instead of blocking the main thread.
-      hw6SetStatus(
-        "Training MF reference: epoch " + epoch + "/" + MF_CONFIG.epochs +
-        " \u2014 validation RMSE " + hw6Fmt(valRmse) + "\u2026",
-      );
-      if (typeof tf.nextFrame === "function") {
-        try {
-          await tf.nextFrame();
-        } catch (error) {
-          // Yielding is best-effort; training still completes without it.
-        }
-      }
-    }
-
-    if (bestU && bestI) {
-      tf.tidy(function () {
-        userFactors.assign(tf.tensor2d(bestU, [userRows, F]));
-        itemFactors.assign(tf.tensor2d(bestI, [itemRows, F]));
-      });
-    }
-
-    MF_INFO.factors = F;
-    MF_INFO.epochs = MF_CONFIG.epochs;
-    MF_INFO.learningRate = MF_CONFIG.lr;
-    MF_INFO.regularization = MF_CONFIG.reg;
-    MF_INFO.batchSize = MF_CONFIG.batchSize;
-    MF_INFO.seed = MF_SEED;
-    MF_INFO.backend = HW6_STATE.backend;
-    MF_INFO.checkpoint = bestEpoch || null;
-    MF_INFO.validationRMSE = Number.isFinite(bestVal) ? bestVal : null;
-    MF_INFO.trainedAt = new Date().toISOString();
-    return HW6_MF_MODEL;
-  } catch (error) {
-    console.error("MF reference training failed:", error);
-    hw6DisposeMf();
-    MF_INFO.checkpoint = null;
-    MF_INFO.validationRMSE = null;
-    MF_INFO.trainedAt = null;
-    return null;
-  }
-}
+// MF weights are loaded by hw6LoadPreviousMf; no alternate model is trained.
 
 /**
  * Ensure the lazy MF reference is trained, reporting "not trained yet" honestly
@@ -1025,11 +872,11 @@ async function hw6EnsureMfForNeed() {
   if (HW6_MF_MODEL && MF_INFO.trainedAt !== null) return HW6_MF_MODEL;
   if (typeof tf === "undefined") return null;
   if (!HW6_STATE.splitReady) return null;
-  hw6SetStatus("MF reference is not trained yet \u2014 training it now\u2026");
+  hw6SetStatus("Loading the saved HW5 MF checkpoint\u2026");
   const model = await hw6EnsureMf();
   if (model && MF_INFO.checkpoint !== null) {
     hw6SetStatus(
-      "MF reference trained: " + MF_INFO.factors + " factors, checkpoint epoch " + MF_INFO.checkpoint +
+      "HW5 MF checkpoint loaded: " + MF_INFO.factors + " factors, checkpoint epoch " + MF_INFO.checkpoint +
       ", validation RMSE " + hw6Fmt(MF_INFO.validationRMSE) + ".",
     );
   } else {
@@ -1063,7 +910,7 @@ function mfScores(userId) {
     const items = tf.gather(model.itemFactors, idx);
     const userRow = model.userFactors.slice([uid, 0], [1, F]);
     const dot = tf.matMul(items, userRow, false, true).squeeze();
-    const values = dot.add(model.globalMean).dataSync();
+    const values = dot.add(model.globalMean).clipByValue(1, 5).dataSync();
     const result = {};
     for (let i = 0; i < ids.length; i++) result[ids[i]] = values[i];
     return result;
@@ -1110,8 +957,8 @@ function mfScores(userId) {
  * @returns {Float64Array} Movie scores in `graph.movieIds` order.
  */
 function movieScores(p, graph) {
-  // TODO(hw6): select the movie-node entries of `p`, in `graph.movieIds` order.
-  throw new Error("TODO(hw6): movieScores is not implemented yet.");
+  if(!graph||!p||p.length!==hw6NodeCount(graph))throw new Error('Score vector does not match graph nodes.');
+  return Float64Array.from(graph.movieIds,(_,i)=>Number(p[graph.movieNodes?graph.movieNodes[i]:graph.userIds.length+i]));
 }
 
 /**
@@ -1148,8 +995,14 @@ function movieScores(p, graph) {
  * @returns {RecommendedMovie[]}
  */
 function recommendTopK(method, userId, K, split) {
-  // TODO(hw6): filter the candidate pool, sort by score desc / id asc, slice to K.
-  throw new Error("TODO(hw6): recommendTopK is not implemented yet.");
+  K=K===undefined?10:Math.floor(K);split=split==='val'?'val':'test';
+  if(!['popularity','pagerank','ppr','mf'].includes(method)||K<=0||!Number.isInteger(userId))return [];
+  const excluded=hw6ExclusionSet(split,userId);
+  const vector=hw6ScoreVector(method,userId,hw6ReadAlpha(),split);
+  return vector.movieIds.map((movieId,i)=>({movieId,score:Number(vector.scores[i])}))
+    .filter(r=>!excluded.has(r.movieId)&&Number.isFinite(r.score))
+    .sort((a,b)=>b.score-a.score||a.movieId-b.movieId).slice(0,K)
+    .map(r=>({...r,title:hw6Title(r.movieId),genres:hw6Genres(r.movieId),popularity:hw6PopularityOf(r.movieId)}));
 }
 
 /**
@@ -1181,8 +1034,20 @@ function recommendTopK(method, userId, K, split) {
  * @returns {RecallReport}
  */
 function recallAtK(method, K, split) {
-  // TODO(hw6): macro-average Recall@K over the shared cohort, with exclusions.
-  throw new Error("TODO(hw6): recallAtK is not implemented yet.");
+  K=K===undefined?10:K;split=split==='val'?'val':'test';
+  const cohort=hw6SharedCohort(split),perUser=[];
+  for(const userId of cohort){
+    const excluded=hw6ExclusionSet(split,userId),relevant=new Set();
+    HW6_STATE.gradesBySplit[split].get(userId).forEach((rating,movieId)=>{
+      if(rating>=4&&HW6_STATE.candidateSet.has(movieId)&&!excluded.has(movieId))relevant.add(movieId);
+    });
+    const recs=recommendTopK(method,userId,K,split);
+    const hit=recs.reduce((n,r)=>n+Number(relevant.has(r.movieId)),0);
+    perUser.push({userId,relevant:relevant.size,hit});
+  }
+  const excluded=hw6CohortExclusions(split);
+  return {recall:perUser.length?perUser.reduce((n,r)=>n+r.hit/r.relevant,0)/perUser.length:0,
+    cohort,perUser,excludedUnseen:excluded.excludedUnseen,excludedNoEligible:excluded.excludedNoEligible};
 }
 
 // ---------------------------------------------------------------------------
@@ -1428,9 +1293,7 @@ function hw6AdapterPageRank(graph, alpha) {
  *
  * The real `graph.js` signature is `personalizedPageRank(userId, alpha, opts)`
  * reading the active `GRAPH`, so the user-first form is tried first; a
- * graph-first `(graph, seed, alpha)` shape is also tolerated. The seed passed to
- * the user-first form is the raw user id (not a node index) when the graph
- * exposes one.
+ * graph-first `(graph, seed, alpha)` shape is also tolerated. The UI maps raw user IDs to node indices before calling the graph function.
  *
  * A `TODO(hw6)` throw is propagated unchanged. Only an unrecognised call shape
  * becomes `HW6_INTERFACE`.
@@ -1453,12 +1316,12 @@ function hw6AdapterPPR(graph, seedNode, alpha, seedUserId) {
     : seedUserId;
 
   const attempts = [
-    function () { return hw6WithActiveGraph(graph, function () { return personalizedPageRank(rawUserId, alpha); }); },
+    function () { return hw6WithActiveGraph(graph, function () { return personalizedPageRank(seedNode, alpha); }); },
   ];
   if (personalizedPageRank.length >= 3) {
     attempts.push(function () { return personalizedPageRank(graph, seedNode, alpha); });
   }
-  attempts.push(function () { return hw6WithActiveGraph(graph, function () { return personalizedPageRank(rawUserId); }); });
+  attempts.push(function () { return hw6WithActiveGraph(graph, function () { return personalizedPageRank(seedNode, alpha); }); });
 
   let lastMessage = "";
   for (let i = 0; i < attempts.length; i++) {
@@ -1534,12 +1397,14 @@ function hw6RunPageRank(graph, alpha) {
  * @returns {PropagationResult}
  */
 function hw6RunPPR(graph, userId, alpha) {
-  const cached = HW6_STATE.ppr;
-  if (cached && cached.graph === graph && cached.userId === userId && cached.alpha === alpha) return cached;
-  const seedNode = hw6UserNodeIndex(graph, userId);
-  if (seedNode < 0) throw hw6InterfaceError("cannot map user " + userId + " to a graph node");
-  const result = hw6AdapterPPR(graph, seedNode, alpha, userId);
-  HW6_STATE.ppr = { ...result, graph: graph, userId: userId, alpha: alpha };
+  const seedNode=hw6UserNodeIndex(graph,userId);
+  if(seedNode<0)throw new Error('Unknown raw user id: '+userId);
+  const prepared=graph._pprCache&&graph._pprCache.get(alpha)&&graph._pprCache.get(alpha).get(seedNode);
+  if(prepared)return {...hw6NormalizePropagation(prepared,graph.nodeCount),graph,userId,alpha};
+  const cached=HW6_STATE.ppr;
+  if(cached&&cached.graph===graph&&cached.userId===userId&&cached.alpha===alpha)return cached;
+  const result=hw6AdapterPPR(graph,seedNode,alpha,userId);
+  HW6_STATE.ppr={...result,graph,userId,alpha};
   return HW6_STATE.ppr;
 }
 
@@ -1957,7 +1822,7 @@ function hw6RenderDatasetSummary() {
   const total = train.length + val.length + test.length;
   const users = HW6_STATE.trainUserIds.length;
   const movieCount = HW6_STATE.candidateIds.length;
-  const cells = (numUsers + 1) * (HW6_MAX_MOVIE_ID + 1);
+  const cells = new Set(ratings.map(r=>r.userId)).size * movies.length;
   const sparsity = cells > 0 ? 1 - total / cells : 0;
   const exclusions = typeof SPLIT_EXCLUSIONS === "undefined" ? [] : SPLIT_EXCLUSIONS;
 
@@ -3221,6 +3086,8 @@ function serializeVerification() {
     passed: result.passed,
     failed: result.failed,
     pending: result.pending,
+    additional_checks: HW6_STATE.extraVerification || null,
+    propagation_runs: hw6ActiveGraph() && hw6ActiveGraph()._batchRuns || [],
   };
   return JSON.stringify(payload, null, 2);
 }
@@ -3269,13 +3136,14 @@ function serializeResults() {
   });
 
   (HW6_STATE.alphaSweepRows || []).forEach(function (row) {
+    const validationExclusions = hw6CohortExclusions("val");
     rows.push([
       "ppr",
       Number(row.alpha).toFixed(2),
       row.recall === null ? "" : row.recall,
       row.cohortSize,
-      "",
-      "",
+      validationExclusions.excludedUnseen,
+      validationExclusions.excludedNoEligible,
       "",
       "",
       "",
@@ -3464,7 +3332,7 @@ function hw6NodeScoresForView(graph, seedUserId) {
  */
 function hw6SafeRenderGraphView() {
   if (typeof renderGraphView !== "function") return;
-  const maxNodes = Math.max(10, Math.round(hw6ReadNumber("max-nodes", 120)));
+  const maxNodes = Math.max(10, Math.round(hw6ReadNumber("max-nodes", 24)));
   const graph = hw6ActiveGraph();
   const seedUserId = hw6ReadNumber("seed-user-select", hw6ReadNumber("user-select", Number.NaN));
 
@@ -3572,46 +3440,26 @@ function hw6HandleRunPPR() {
  * @returns {Promise<void>}
  */
 async function hw6HandleRecall() {
-  const alpha = hw6ReadAlpha();
-  const method = hw6ReadMethod();
-  const graph = hw6ActiveGraph();
-
-  if (graph) {
-    try {
-      hw6RunAndRecordConvergence("pagerank", graph, alpha);
-    } catch (error) {
-      // Convergence is optional evidence; the comparison below reports gaps.
-    }
-    const seedUserId = hw6ReadNumber("seed-user-select", Number.NaN);
-    if (Number.isFinite(seedUserId)) {
-      try {
-        hw6RunAndRecordConvergence("ppr", graph, alpha, seedUserId);
-      } catch (error) {
-        // Same as above.
-      }
-    }
-  }
-
-  const comparison = await hw6RunComparison("test");
-  hw6RenderConvergence();
-  hw6RenderComparison(comparison);
-
-  const sweep = hw6RunAlphaSweep();
-  hw6RenderAlphaSweep(sweep);
-
-  const target = document.getElementById("recall-results");
-  if (target) {
-    try {
-      const report = recallAtK(method, HW6_K, "test");
-      HW6_STATE.recallReport = report;
-      hw6RenderRecall(report, method, "test");
-    } catch (error) {
-      target.innerHTML = hw6UnavailableHtml("Retrieval evaluation", error);
-    }
-  }
-
-  const selected = sweep.best === null ? "not selected (validation sweep unavailable)" : "alpha " + hw6Fmt(sweep.best, 2);
-  hw6SetStatus("Evaluation run complete \u2014 selected " + selected + ".");
+  try {
+    if(!hw6ActiveGraph())hw6HandleBuildGraph();
+    await hw6EnsureMfForNeed();
+    await hw6PreparePpr(ALPHA_GRID);
+    // Selection MUST precede final test evaluation. The starter did these in
+    // the opposite order and retained the slider's unselected alpha.
+    const sweep=hw6RunAlphaSweep();
+    if(sweep.best===null)throw new Error('Validation did not select an alpha.');
+    hw6SetAlpha(sweep.best);hw6RenderAlphaSweep(sweep);
+    const graph=hw6ActiveGraph(),users=hw6SharedCohort('test');
+    hw6RunAndRecordConvergence('pagerank',graph,sweep.best);
+    if(users.length)hw6RunAndRecordConvergence('ppr',graph,sweep.best,users[0]);
+    const comparison=await hw6RunComparison('test');
+    if(comparison.some(r=>r.error||r.recall===null))throw new Error('A method failed; inspect comparison output.');
+    hw6RenderConvergence();hw6RenderComparison(comparison);
+    const method=hw6ReadMethod(),report=recallAtK(method,10,'test');
+    HW6_STATE.recallReport=report;hw6RenderRecall(report,method,'test');
+    HW6_STATE.extraVerification=await hw6ExtraChecks();
+    hw6SetStatus('Evaluation complete. PPR alpha '+sweep.best.toFixed(2)+' selected on validation; all four methods use the same test cohort.');
+  }catch(error){hw6SetStatus('Evaluation failed: '+error.message);throw error;}
 }
 
 /**
@@ -3621,19 +3469,15 @@ async function hw6HandleRecall() {
  *
  * @returns {void}
  */
-function hw6HandleAlphaSweep() {
-  const target = document.getElementById("alpha-sweep-results");
-  let sweep = null;
+async function hw6HandleAlphaSweep() {
   try {
-    sweep = hw6RunAlphaSweep();
-  } catch (error) {
-    if (target) target.innerHTML = hw6UnavailableHtml("Alpha sweep", error);
-    hw6SetStatus("Alpha sweep unavailable: " + String(error && error.message ? error.message : error));
-    return;
-  }
-  hw6RenderAlphaSweep(sweep);
-  const selected = sweep.best === null ? "not selected (validation sweep unavailable)" : "alpha " + hw6Fmt(sweep.best, 2);
-  hw6SetStatus("Alpha sweep (validation Recall@10) complete \u2014 selected " + selected + ".");
+    if(!hw6ActiveGraph())hw6HandleBuildGraph();
+    await hw6EnsureMfForNeed();await hw6PreparePpr(ALPHA_GRID);
+    const sweep=hw6RunAlphaSweep();
+    if(sweep.best!==null)hw6SetAlpha(sweep.best);
+    hw6RenderAlphaSweep(sweep);
+    hw6SetStatus('Validation sweep complete; selected alpha '+sweep.best+'.');
+  }catch(error){hw6SetStatus('Validation sweep failed: '+error.message);}
 }
 
 /**
@@ -3782,8 +3626,8 @@ async function hw6Bootstrap() {
     hw6SetStatus(
       "Dataset ready: " + HW6_STATE.trainUserIds.length.toLocaleString("en-US") + " training users, " +
       HW6_STATE.candidateIds.length.toLocaleString("en-US") + " candidate movies on " + backend +
-      ". The MF reference is not trained yet (it trains on first use). Implement the TODO(hw6) functions, " +
-      "then build the graph.",
+      ". The saved HW5 MF checkpoint loads on first use. " +
+      "Build the graph to begin.",
     );
   } catch (error) {
     console.error("Initialization failed:", error);

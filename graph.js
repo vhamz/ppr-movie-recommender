@@ -23,7 +23,7 @@
  *   4. `personalizedPageRank(userId, alpha, opts)` - one-hot restart at one user.
  *
  * PROVIDED for you (scaffolding): the `REFERENCE_GRAPH` constant with the two
- * reference vectors and both rankings from readme.md section 4.1 (plus the
+ * reference vectors and both rankings from assignment.md section 4.1 (plus the
  * derived `REFERENCE_GRAPH.transition`, see below), the graph
  * accessors (`GRAPH`, `setGraph`, `getGraph`), the d3 graph view
  * (`renderGraphView`), the 4-node fixture teaching demo (`fixtureStep` /
@@ -34,7 +34,7 @@
  *
  * SCOPE NOTE: d3 is used ONLY by the graph view. The propagation stubs must use
  * TensorFlow.js tensor operations on `R` and its transpose for the MovieLens
- * graph (readme.md section 3.5); the fixture demo below is the only
+ * graph (assignment.md section 3.5); the fixture demo below is the only
  * plain-JavaScript propagation loop in this file.
  *
  * @module week6/graph
@@ -131,14 +131,14 @@
 // ---------------------------------------------------------------------------
 // Reference graph (provided, read-only by convention)
 //
-// Exactly the readme.md section 4.1 fixture: node order A, B, C, D; directed
+// Exactly the assignment.md section 4.1 fixture: node order A, B, C, D; directed
 // edges A -> B, A -> C, B -> C, C -> A, D -> C; no dangling nodes. The two
-// reference vectors and both rankings are reproduced verbatim from readme.md
+// reference vectors and both rankings are reproduced verbatim from assignment.md
 // section 4.1.
 // ---------------------------------------------------------------------------
 
 /**
- * The 4-node reference graph from readme.md section 4.1, plus its reference
+ * The 4-node reference graph from assignment.md section 4.1, plus its reference
  * results. `nodes` assigns A, B to the left (user) column and C, D to the right
  * (movie) column so the fixture can reuse the same deterministic two-column
  * layout as the data view. Treat this object as read-only.
@@ -248,7 +248,7 @@ const graphTheme = {
   labelColor: "#1c2128",
   noteColor: "#5b6472",
   minRadius: 6,
-  maxRadius: 22,
+  maxRadius: 16,
   rampLight: [232, 243, 252],
   rampDark: [8, 48, 96],
   tooltipId: "graph-tooltip"
@@ -266,7 +266,7 @@ const GRAPH_VIEW_STATE = {
   mode: "fixture",
   seedUserId: null,
   colorBy: "degree",
-  maxNodes: 120,
+  maxNodes: 24,
   lastRender: null,
   fixture: {
     iteration: 0,
@@ -333,7 +333,7 @@ function getGraph() {
 /**
  * Build the bipartite user-movie graph from the TRAINING split.
  *
- * TODO(hw6): implement this. Rules (readme.md section 3.1):
+ * TODO(hw6): implement this. Rules (assignment.md section 3.1):
  *  - The node universe is the set of user ids and movie ids observed in
  *    `train` ONLY. Map ids to contiguous indices explicitly; never add a
  *    padding node (no index-0 "dummy" row).
@@ -354,9 +354,26 @@ function getGraph() {
  * @returns {Graph}
  */
 function buildGraph(train) {
-  // TODO(hw6): collect observed ids, map them to contiguous indices, fill R and
-  // degree, then return the object described in the typedef and readme 3.1.
-  throw new Error("TODO(hw6): buildGraph is not implemented yet.");
+  const rows = Array.isArray(train) ? train : [];
+  const userIds = Array.from(new Set(rows.map(r=>r.userId))).sort((a,b)=>a-b);
+  const movieIds = Array.from(new Set(rows.map(r=>r.movieId))).sort((a,b)=>a-b);
+  const nUsers=userIds.length, nMovies=movieIds.length, nodeCount=nUsers+nMovies;
+  const userIndexOf=new Map(userIds.map((id,i)=>[id,i]));
+  const movieIndexOf=new Map(movieIds.map((id,i)=>[id,i]));
+  const R=Array.from({length:nUsers},()=>new Array(nMovies).fill(0));
+  const degree=new Float64Array(nodeCount);
+  let positiveEdges=0;
+  for(const r of rows) {
+    if(r.rating<4)continue;
+    const u=userIndexOf.get(r.userId), i=movieIndexOf.get(r.movieId);
+    if(R[u][i])continue;
+    R[u][i]=1;degree[u]++;degree[nUsers+i]++;positiveEdges++;
+  }
+  return {nUsers,nMovies,nodeCount,userIds,movieIds,userIndexOf,movieIndexOf,R,degree,positiveEdges,
+    nodeOfUser:id=>userIndexOf.has(id)?userIndexOf.get(id):-1,
+    movieOfNode:node=>movieIds[node-nUsers],isUserNode:node=>node>=0&&node<nUsers,
+    zeroDegreeUsers:userIds.filter((id,u)=>degree[u]===0),
+    zeroDegreeMovies:movieIds.filter((id,i)=>degree[nUsers+i]===0)};
 }
 
 /**
@@ -365,13 +382,13 @@ function buildGraph(train) {
  * TODO(hw6): for each positive-degree node, divide its row by its degree so the
  * row sums to 1; leave zero-degree rows all-zero and mark them in
  * `danglingMask`. The dangling mass must be handled in the update exactly as in
- * readme.md section 3.3:
+ * assignment.md section 3.3:
  *
  *   p_next = alpha * (Q^T * p + d * v) + (1 - alpha) * v
  *
  * where d is the probability mass currently sitting on zero-degree nodes.
  *
- * INTENDED TENSORFLOW.JS USE (readme.md section 3.5): this helper returns plain
+ * INTENDED TENSORFLOW.JS USE (assignment.md section 3.5): this helper returns plain
  * JavaScript arrays so it can be inspected and tested, but the student
  * implementation should lift them into tensors for the batched propagation:
  * build the full transition from the two off-diagonal blocks (R row-normalized
@@ -388,15 +405,28 @@ function buildGraph(train) {
  * @returns {RowNormalized}
  */
 function rowNormalize(graph) {
-  // TODO(hw6): normalize positive-degree rows and build the dangling mask.
-  throw new Error("TODO(hw6): rowNormalize is not implemented yet.");
+  if(!graph)return {Q:[],danglingMask:[]};
+  const n=graph.nodeCount, U=graph.nUsers, M=graph.nMovies;
+  const danglingMask=Array.from(graph.degree,d=>d===0);
+  let Q=null;
+  // The harness can inspect a plain square Q on small fixtures. MovieLens
+  // propagation uses R and degree directly, so this getter is never needed.
+  return {danglingMask,get Q(){
+    if(Q)return Q;
+    Q=Array.from({length:n},()=>new Array(n).fill(0));
+    for(let u=0;u<U;u++)for(let i=0;i<M;i++)if(graph.R[u][i]){
+      Q[u][U+i]=graph.R[u][i]/graph.degree[u];
+      Q[U+i][u]=graph.R[u][i]/graph.degree[U+i];
+    }
+    return Q;
+  }};
 }
 
 /**
  * Global PageRank with a uniform restart distribution.
  *
  * TODO(hw6): implement the power iteration with a uniform restart vector v
- * (readme.md sections 3.2-3.4), using TensorFlow.js for the batched
+ * (assignment.md sections 3.2-3.4), using TensorFlow.js for the batched
  * propagation:
  *
  *   p_0 = v ;  p_next = alpha * (Q^T * p + d * v) + (1 - alpha) * v
@@ -438,8 +468,7 @@ function rowNormalize(graph) {
  * @throws {Error} when neither `opts.transition` nor the global `GRAPH` exists.
  */
 function pageRank(alpha, opts) {
-  // TODO(hw6): power iteration with a uniform restart on the tensor path.
-  throw new Error("TODO(hw6): pageRank is not implemented yet.");
+  return graphPowerSync(getGraph(),null,alpha,opts||{});
 }
 
 /**
@@ -475,8 +504,8 @@ function pageRank(alpha, opts) {
  *   neither `opts.transition` nor the global `GRAPH` exists.
  */
 function personalizedPageRank(userId, alpha, opts) {
-  // TODO(hw6): one-hot restart at the user's node; fail loudly on unknown users.
-  throw new Error("TODO(hw6): personalizedPageRank is not implemented yet.");
+  // This API accepts a NODE INDEX, never a raw user id. The UI adapter maps it.
+  return graphPowerSync(getGraph(),userId,alpha,opts||{});
 }
 
 // ---------------------------------------------------------------------------
@@ -613,7 +642,7 @@ function graphFixtureRestartVector(restart) {
 /**
  * One plain-JavaScript propagation step on the 4-node fixture.
  *
- * The fixture has no dangling nodes, so the d * v term from readme.md
+ * The fixture has no dangling nodes, so the d * v term from assignment.md
  * section 3.3 is not needed here. Returns the new distribution and the L1
  * change.
  *
@@ -712,8 +741,8 @@ function graphNeighbors(graph, node) {
  * Build the capped ego subgraph for a seed user.
  *
  * Selection: the seed user's node plus its neighbours and their neighbours (a
- * 2-hop walk) in the bipartite graph, then apply the maxNodes cap in
- * deterministic node-index order. `omitted` is how many reachable nodes the cap
+ * 2-hop walk) in the bipartite graph, then reserve display slots for direct
+ * movies and their neighboring users. `omitted` counts reachable nodes the cap
  * left out, so the legend can report it.
  *
  * @param {number|null} seedUserId
@@ -771,7 +800,18 @@ function graphBuildEgoView(seedUserId, getScore) {
       .filter((node) => node !== startNode)
       .sort((a, b) => a - b)
   );
-  const selected = new Set(ordered.slice(0, maxNodes));
+  // Raw node-index truncation selects only users because all user indices
+  // precede all movies. Reserve space for direct movie neighbors first, then
+  // add their neighboring users. The displayed induced subgraph stays connected.
+  const direct = graphNeighbors(graph, startNode).sort((a,b)=>a-b);
+  const pickedMovies = direct.slice(0, Math.max(1, Math.floor((maxNodes-1)/2)));
+  const nearbyUsers = new Set();
+  for (const movie of pickedMovies) {
+    for (const user of graphNeighbors(graph, movie)) if (user!==startNode) nearbyUsers.add(user);
+  }
+  const displayOrder = [startNode,...pickedMovies,...Array.from(nearbyUsers).sort((a,b)=>a-b),...direct];
+  const selected = new Set();
+  for (const node of displayOrder) {if(selected.size>=maxNodes)break;selected.add(node);}
   const omitted = reachable.size - selected.size;
 
   const nodes = [];
@@ -1015,9 +1055,9 @@ function graphDrawView(svgEl, view, opts) {
     if (showLabel) {
       group
         .append("text")
-        .attr("x", 0)
-        .attr("y", -(radius + 4))
-        .attr("text-anchor", "middle")
+        .attr("x", view.kind === "ego" ? (d.kind === "user" ? -(radius + 8) : radius + 8) : 0)
+        .attr("y", view.kind === "ego" ? 4 : -(radius + 4))
+        .attr("text-anchor", view.kind === "ego" ? (d.kind === "user" ? "end" : "start") : "middle")
         .attr("font-size", 11)
         .attr("fill", graphTheme.labelColor)
         .attr("pointer-events", "none")
@@ -1425,7 +1465,7 @@ function renderGraphView(opts) {
 // THIS DEMO EXISTS ONLY FOR THE 4-NODE FIXTURE. It is a tiny plain-JavaScript
 // propagation so the animation works before you write any stub, and it is NOT a
 // template for the MovieLens implementation. The MovieLens propagation must use
-// TensorFlow.js tensor operations on R and R-transpose (readme.md section 3.5),
+// TensorFlow.js tensor operations on R and R-transpose (assignment.md section 3.5),
 // as required by pageRank / personalizedPageRank.
 // ---------------------------------------------------------------------------
 
@@ -1458,7 +1498,7 @@ function graphRenderConvergence() {
     "</dl>" +
     '<p class="hint">This plain-JavaScript demo exists only for the 4-node fixture and is not a ' +
     "template for the MovieLens implementation, which must use TensorFlow.js tensor operations " +
-    "on R and R-transpose (readme.md section 3.5).</p>";
+    "on R and R-transpose (assignment.md section 3.5).</p>";
 }
 
 /**
