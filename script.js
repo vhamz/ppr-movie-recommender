@@ -400,6 +400,8 @@ function hw6InvalidateCaches() {
 function hw6SetStatus(message) {
   const status = document.getElementById("status");
   if (status) status.textContent = message;
+  const local = document.getElementById("action-status");
+  if (local) local.textContent = message;
 }
 
 /**
@@ -1580,6 +1582,7 @@ async function hw6RunComparison(split) {
 
   for (let m = 0; m < methods.length; m++) {
     const method = methods[m];
+    if(method === "pagerank") await hw6UiWalk(null,alpha);
     const usesAlpha = method === "pagerank" || method === "ppr";
     const row = {
       method: method,
@@ -1601,12 +1604,12 @@ async function hw6RunComparison(split) {
         // Never report a silent 0: state plainly that the reference is untrained.
         row.note = "MF not trained yet \u2014 its recall is not meaningful.";
       } else {
-        const report = recallAtK(method, HW6_K, name);
+        const report = await hw6RecallAsync(method, HW6_K, name);
         row.recall = Number(report.recall);
         if (Array.isArray(report.cohort)) row.cohortSize = report.cohort.length;
         if (Number.isFinite(Number(report.excludedUnseen))) row.excludedUnseen = Number(report.excludedUnseen);
         if (Number.isFinite(Number(report.excludedNoEligible))) row.excludedNoEligible = Number(report.excludedNoEligible);
-        row.meanPopularity = hw6MeanListPopularityForCohort(method, cohort, name, alpha);
+        row.meanPopularity = await hw6MeanPopularityAsync(method, cohort, name, alpha);
         const record = usesAlpha ? HW6_STATE.convergence[method === "ppr" ? "ppr" : "pagerank"] : null;
         if (record) {
           row.iterations = record.iterations;
@@ -3216,19 +3219,19 @@ function hw6WireExports() {
   const verification = document.getElementById("export-verification");
   if (verification) {
     verification.addEventListener("click", function () {
-      download("verification.json", serializeVerification(), "application/json");
+      hw6SetStatus(download("verification.json", serializeVerification(), "application/json") ? "Downloaded verification.json." : "Verification download failed.");
     });
   }
   const results = document.getElementById("export-results");
   if (results) {
     results.addEventListener("click", function () {
-      download("results.csv", serializeResults(), "text/csv");
+      hw6SetStatus(download("results.csv", serializeResults(), "text/csv") ? "Downloaded results.csv." : "Results download failed.");
     });
   }
   const recommendations = document.getElementById("export-recommendations");
   if (recommendations) {
     recommendations.addEventListener("click", function () {
-      download("recommendations.csv", serializeRecommendations(), "text/csv");
+      hw6SetStatus(download("recommendations.csv", serializeRecommendations(), "text/csv") ? "Downloaded recommendations.csv." : "Recommendations download failed.");
     });
   }
 }
@@ -3300,8 +3303,8 @@ function hw6NodeScoresForView(graph, seedUserId) {
   const method = hw6ReadMethod();
   const alpha = hw6ReadAlpha();
   try {
-    if (method === "pagerank") return Float64Array.from(hw6RunPageRank(graph, alpha).scores);
-    if (method === "ppr") return Float64Array.from(hw6RunPPR(graph, seedUserId, alpha).scores);
+    if (method === "pagerank") return HW6_STATE.pageRank?.graph === graph && HW6_STATE.pageRank.alpha === alpha ? Float64Array.from(HW6_STATE.pageRank.scores) : null;
+    if (method === "ppr") return graph._pprCache?.get(alpha)?.has(graph.nodeOfUser(seedUserId)) ? Float64Array.from(hw6RunPPR(graph, seedUserId, alpha).scores) : null;
     const vector = new Float64Array(n);
     // The view accessor takes a GLOBAL node index.
     const index = hw6MovieNodeIndex(graph);
@@ -3446,7 +3449,7 @@ async function hw6HandleRecall() {
     await hw6PreparePpr(ALPHA_GRID);
     // Selection MUST precede final test evaluation. The starter did these in
     // the opposite order and retained the slider's unselected alpha.
-    const sweep=hw6RunAlphaSweep();
+    const sweep=await hw6RunAlphaSweepAsync();
     if(sweep.best===null)throw new Error('Validation did not select an alpha.');
     hw6SetAlpha(sweep.best);hw6RenderAlphaSweep(sweep);
     const graph=hw6ActiveGraph(),users=hw6SharedCohort('test');
@@ -3455,7 +3458,7 @@ async function hw6HandleRecall() {
     const comparison=await hw6RunComparison('test');
     if(comparison.some(r=>r.error||r.recall===null))throw new Error('A method failed; inspect comparison output.');
     hw6RenderConvergence();hw6RenderComparison(comparison);
-    const method=hw6ReadMethod(),report=recallAtK(method,10,'test');
+    const method=hw6ReadMethod(),report=await hw6RecallAsync(method,10,'test');
     HW6_STATE.recallReport=report;hw6RenderRecall(report,method,'test');
     HW6_STATE.extraVerification=await hw6ExtraChecks();
     hw6SetStatus('Evaluation complete. PPR alpha '+sweep.best.toFixed(2)+' selected on validation; all four methods use the same test cohort.');
@@ -3473,7 +3476,7 @@ async function hw6HandleAlphaSweep() {
   try {
     if(!hw6ActiveGraph())hw6HandleBuildGraph();
     await hw6EnsureMfForNeed();await hw6PreparePpr(ALPHA_GRID);
-    const sweep=hw6RunAlphaSweep();
+    const sweep=await hw6RunAlphaSweepAsync();
     if(sweep.best!==null)hw6SetAlpha(sweep.best);
     hw6RenderAlphaSweep(sweep);
     hw6SetStatus('Validation sweep complete; selected alpha '+sweep.best+'.');
@@ -3561,28 +3564,28 @@ function hw6WireControls() {
   }
 
   const buildButton = document.getElementById("build-graph");
-  if (buildButton) buildButton.addEventListener("click", hw6HandleBuildGraph);
+  if (buildButton) buildButton.addEventListener("click", () => hw6UiAction(buildButton, hw6HandleBuildGraph, "graph-summary-body"));
 
   const pagerankButton = document.getElementById("run-pagerank");
-  if (pagerankButton) pagerankButton.addEventListener("click", hw6HandleRunPageRank);
+  if (pagerankButton) pagerankButton.addEventListener("click", () => hw6UiAction(pagerankButton, hw6HandleRunPageRank, "convergence-results"));
 
   const pprButton = document.getElementById("run-ppr");
-  if (pprButton) pprButton.addEventListener("click", hw6HandleRunPPR);
+  if (pprButton) pprButton.addEventListener("click", () => hw6UiAction(pprButton, hw6HandleRunPPR, "convergence-results"));
 
   const recommendButton = document.getElementById("recommend-btn");
-  if (recommendButton) recommendButton.addEventListener("click", hw6RenderRecommendations);
+  if (recommendButton) recommendButton.addEventListener("click", () => hw6UiAction(recommendButton, hw6RenderRecommendations, "recommendations"));
 
   const recallButton = document.getElementById("recall-btn");
-  if (recallButton) recallButton.addEventListener("click", hw6HandleRecall);
+  if (recallButton) recallButton.addEventListener("click", () => hw6UiAction(recallButton, hw6HandleRecall, "comparison-results"));
 
   const alphaSweepButton = document.getElementById("alpha-sweep-btn");
-  if (alphaSweepButton) alphaSweepButton.addEventListener("click", hw6HandleAlphaSweep);
+  if (alphaSweepButton) alphaSweepButton.addEventListener("click", () => hw6UiAction(alphaSweepButton, hw6HandleAlphaSweep, "alpha-sweep-results"));
 
   const twoUserDemoButton = document.getElementById("two-user-demo-btn");
-  if (twoUserDemoButton) twoUserDemoButton.addEventListener("click", hw6HandleTwoUserDemo);
+  if (twoUserDemoButton) twoUserDemoButton.addEventListener("click", () => hw6UiAction(twoUserDemoButton, hw6HandleTwoUserDemo, "two-user-demo-results"));
 
   const testButton = document.getElementById("run-tests");
-  if (testButton) testButton.addEventListener("click", hw6HandleRunTests);
+  if (testButton) testButton.addEventListener("click", () => hw6UiAction(testButton, hw6HandleRunTests, "self-checks"));
 
   hw6WireExports();
 }

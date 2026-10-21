@@ -12,6 +12,9 @@ in the next commit. The HW5 directory and dataset files are unchanged.
 1. In this directory, run `python3 -m http.server 8056`.
 2. Open http://localhost:8056/ (file:// cannot fetch local datasets).
 3. Click **Build graph**, then **Run tests** (12 pass, 0 fail, 0 pending).
+   Each action automatically builds the graph if needed. Buttons show a running
+   state; a persistent progress message stays visible while computing. Results
+   scroll into view on completion. Conflicting actions are disabled until done.
 4. Click **Evaluate Recall@10 - all four methods**. The first run sweeps
    validation alphas before choosing the final test setting, loads the exact
    HW5 MF checkpoint, and runs additional numerical/memory checks.
@@ -43,6 +46,9 @@ Stop at L1 < 1e-6, or after 500 updates with nonconvergence reported.
 Core MovieLens propagation is batched TensorFlow.js matrix multiplication using
 the two R blocks, with no per-edge JavaScript propagation and no square tensor.
 Probability vectors are read asynchronously where practical and tensors disposed.
+Interactive PageRank/PPR walks use the asynchronous batched kernel too.
+Validation and test ranking loops yield between groups of users so scrolling
+and progress updates continue throughout evaluation.
 
 Some alpha-0.95 WebGL walks exhibit a float32 numerical plateau just above the
 tolerance. Only affected seeds restart on the TF.js CPU backend, with the SAME

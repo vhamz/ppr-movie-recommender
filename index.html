@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>HW6 — Graph-Based Recommendations with Personalized PageRank</title>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=20261021-ui2">
 </head>
 <body>
   <noscript>
@@ -100,7 +100,7 @@
         <button type="button" id="run-tests" class="secondary">Run tests</button>
       </div>
 
-      <p class="hint">Controls stay enabled only when the step they depend on is available; a disabled control is reported in the status line.</p>
+      <p id="action-status" class="status" role="status" aria-live="polite">Choose an action. Required preparation runs automatically.</p><p class="hint">Results open automatically. Full evaluation computes four alpha values and may take several minutes; progress appears here.</p>
     </section>
 
     <section aria-labelledby="graph-view-heading" class="panel">
@@ -193,7 +193,7 @@
   <script src="vendor/d3.min.js"></script>
   <script src="data.js"></script>
   <script src="graph.js"></script>
-  <script src="ppr-core.js"></script>
-  <script src="script.js"></script>
+  <script src="ppr-core.js?v=20261021-ui2"></script>
+  <script src="script.js?v=20261021-ui2"></script>
 </body>
 </html>

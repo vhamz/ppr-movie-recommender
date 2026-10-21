@@ -96,13 +96,14 @@ async function graphPowerBatch(graph, restartNodes, alpha, opts = {}) {
         return tf.where(frozen, state.p, next);
       });
       state.p.dispose(); next.dispose(); state.p = kept;
+      if (opts.onProgress && iteration % 8 === 0) opts.onProgress(iteration, done.filter(Boolean).length, state.width);
       if (done.every(Boolean)) break;
-      if (iteration % 8 === 0) await tf.nextFrame();
+      if (tf.getBackend() === "cpu" || iteration % 4 === 0) await new Promise(resolve => setTimeout(resolve, 0));
     }
     const extra = tf.tidy(() => state.step(state.p).sub(state.p).abs().sum(0));
     const extraData = await extra.data(); extra.dispose();
     const all = await state.p.data();
-    return restartNodes.map((node, j) => ({
+    return (restartNodes || [null]).map((node, j) => ({
       p:Float64Array.from({length:state.n}, (_, i) => all[i*state.width+j]),
       iterations:iterations[j], residual:residuals[j], converged:done[j],
       mass:masses[j], extraResidual:extraData[j], maxMassError, minScore
@@ -148,14 +149,14 @@ async function hw6PreparePpr(alphas) {
       const missing = users.filter(id=>!cache.has(graph.nodeOfUser(id)));
       // The full batch uses matrix multiplication efficiently on WebGL and
       // remains small (2,554 x ~930 floats). Split to bound device memory.
-      const batchSize = 128;
+      const batchSize = tf.getBackend() === "cpu" ? 16 : 128;
       for (let start = 0; start < missing.length; start += batchSize) {
         const ids = missing.slice(start,start+batchSize), nodes = ids.map(id=>graph.nodeOfUser(id));
         hw6SetStatus('Computing PPR: alpha '+alpha.toFixed(2)+', users '+(start+1)+'-'+Math.min(start+batchSize,missing.length)+' / '+missing.length+'...');
         console.log('PPR_PROGRESS',alpha,start,missing.length);
         await tf.nextFrame();
         const before = tf.memory().numTensors, t0 = performance.now();
-        const results = await graphPowerBatch(graph,nodes,alpha);
+        const results = await graphPowerBatch(graph,nodes,alpha,{onProgress:(iteration,done,total)=>hw6SetStatus('PPR alpha '+alpha.toFixed(2)+': users '+(start+1)+'–'+Math.min(start+batchSize,missing.length)+' / '+missing.length+', iteration '+iteration+'; converged '+done+'/'+total)});
         const fallback=[];
         const stalled=results.map((r,j)=>r.converged?-1:j).filter(j=>j>=0);
         if(stalled.length&&tf.getBackend()!=='cpu'){
@@ -166,7 +167,7 @@ async function hw6PreparePpr(alphas) {
           hw6SetStatus('Checking '+stalled.length+' high-alpha walks on the TensorFlow.js CPU backend...');
           try {
             await tf.setBackend('cpu');await tf.ready();
-            const retried=await graphPowerBatch(graph,stalled.map(j=>nodes[j]),alpha);
+            const retried=await graphPowerBatch(graph,stalled.map(j=>nodes[j]),alpha,{onProgress:(iteration,done,total)=>hw6SetStatus('CPU precision check, alpha '+alpha+': iteration '+iteration+'; converged '+done+'/'+total)});
             for(let k=0;k<stalled.length;k++){
               const j=stalled[k];
               fallback.push({userId:ids[j],initialBackend:backend,initialIterations:results[j].iterations,
@@ -225,4 +226,116 @@ async function hw6ExtraChecks() {
   return {cappedConverged:capped.converged,unknownThrows,maxSingleBatch,maxRepeat,maxSeedIndexError,
     filtering,tensorsBefore:before,tensorsAfter:after,batchRuns:graph._batchRuns,
     passed:true};
+}
+
+
+// UI actions precompute expensive walks asynchronously before the synchronous
+// rendering/scoring adapters consume them. One action at a time avoids backend
+// switches and graph mutations racing with an evaluation.
+let hw6UiBusy = false;
+async function hw6UiWalk(userId, alpha) {
+  const graph = hw6ActiveGraph();
+  const node = userId === null ? null : graph.nodeOfUser(userId);
+  if (userId === null && HW6_STATE.pageRank?.graph === graph && HW6_STATE.pageRank.alpha === alpha) return;
+  if (userId !== null && graph._pprCache?.get(alpha)?.has(node)) return;
+  hw6SetStatus('Computing ' + (userId === null ? 'global PageRank' : 'PPR for user '+userId) + ' at alpha '+alpha+'…');
+  await new Promise(resolve => setTimeout(resolve, 20));
+  let result = (await graphPowerBatch(graph, node === null ? null : [node], alpha))[0];
+  if (!result.converged && tf.getBackend() !== 'cpu') {
+    const backend = tf.getBackend();
+    try { await tf.setBackend('cpu'); result = (await graphPowerBatch(graph,node === null ? null : [node],alpha))[0]; }
+    finally { await tf.setBackend(backend); }
+  }
+  if (!result.converged) throw new Error('Walk did not converge. Lower alpha and retry.');
+  if (node === null) HW6_STATE.pageRank = {...hw6NormalizePropagation(result,graph.nodeCount),graph,alpha};
+  else {
+    graph._pprCache ||= new Map();
+    if (!graph._pprCache.has(alpha)) graph._pprCache.set(alpha,new Map());
+    graph._pprCache.get(alpha).set(node,result);
+  }
+}
+async function hw6UiAction(button, handler, targetId) {
+  if (hw6UiBusy) return;
+  hw6UiBusy = true;
+  const controls = Array.from(document.querySelectorAll('button,input,select')).map(el=>({el,disabled:el.disabled}));
+  const label = button.textContent;
+  controls.forEach(({el})=>el.disabled=true);
+  button.textContent = label+' — running…';
+  document.getElementById('action-status')?.setAttribute('aria-busy','true');
+  hw6SetStatus(label+' — preparing…');
+  try {
+    await new Promise(resolve=>setTimeout(resolve,30));
+    if (!HW6_STATE.loaded) throw new Error('Dataset is still loading. Please retry once loading finishes.');
+    if (!hw6ActiveGraph()) hw6HandleBuildGraph();
+    const alpha=hw6ReadAlpha(), method=hw6ReadMethod();
+    const seed=hw6ReadNumber('seed-user-select',hw6ReadNumber('user-select',1));
+    const user=hw6ReadNumber('user-select',1);
+    if (handler===hw6HandleTwoUserDemo) {
+      const users=hw6SharedCohort('test').slice(0,2);
+      for(const a of [.85,.5]) for(const id of users) await hw6UiWalk(id,a);
+    }
+    if (handler===hw6HandleRunPageRank || (handler===hw6RenderRecommendations && method==='pagerank')) await hw6UiWalk(null,alpha);
+    if (handler===hw6HandleRunPPR) await hw6UiWalk(seed,alpha);
+    if (handler===hw6RenderRecommendations && method==='ppr') await hw6UiWalk(user,alpha);
+    // Graph recolouring must also use a prepared score vector.
+    if ([hw6HandleBuildGraph,hw6HandleRunPageRank,hw6HandleRunPPR].includes(handler)) {
+      if(method==='ppr') await hw6UiWalk(seed,alpha);
+      if(method==='pagerank') await hw6UiWalk(null,alpha);
+    }
+    await handler();
+    if(handler===hw6RenderRecommendations) hw6SetStatus('Top-10 recommendations ready for user '+user+'.');
+    const target=document.getElementById(targetId);
+    if(target) target.scrollIntoView({behavior:'smooth',block:'center'});
+  } catch(error) {
+    console.error(error);
+    hw6SetStatus(label+' failed: '+error.message);
+  } finally {
+    controls.forEach(({el,disabled})=>el.disabled=disabled);
+    button.textContent=label;
+    document.getElementById('action-status')?.setAttribute('aria-busy','false');
+    hw6UiBusy=false;
+  }
+}
+
+
+async function hw6RecallAsync(method, K, split) {
+  const cohort=hw6SharedCohort(split),perUser=[];
+  for(let i=0;i<cohort.length;i++) {
+    const userId=cohort[i],excluded=hw6ExclusionSet(split,userId),relevant=new Set();
+    HW6_STATE.gradesBySplit[split].get(userId).forEach((rating,movieId)=>{
+      if(rating>=4&&HW6_STATE.candidateSet.has(movieId)&&!excluded.has(movieId)) relevant.add(movieId);
+    });
+    const recs=recommendTopK(method,userId,K,split);
+    perUser.push({userId,relevant:relevant.size,hit:recs.reduce((n,r)=>n+Number(relevant.has(r.movieId)),0)});
+    if(i%16===0) {
+      hw6SetStatus('Evaluating '+method+' / '+split+' / alpha '+hw6ReadAlpha()+': user '+(i+1)+' of '+cohort.length+'…');
+      await new Promise(resolve=>setTimeout(resolve,0));
+    }
+  }
+  const excluded=hw6CohortExclusions(split);
+  return {recall:perUser.length?perUser.reduce((n,r)=>n+r.hit/r.relevant,0)/perUser.length:0,
+    cohort,perUser,excludedUnseen:excluded.excludedUnseen,excludedNoEligible:excluded.excludedNoEligible};
+}
+async function hw6MeanPopularityAsync(method,cohort,split,alpha) {
+  let total=0,users=0;
+  for(let i=0;i<cohort.length;i++) {
+    const mean=hw6MeanPopularity(recommendTopK(method,cohort[i],HW6_K,split));
+    if(mean!==null){total+=mean;users++;}
+    if(i%16===0) await new Promise(resolve=>setTimeout(resolve,0));
+  }
+  return users?total/users:null;
+}
+async function hw6RunAlphaSweepAsync() {
+  const rows=[];let best=null,bestRecall=-Infinity;
+  const previous=hw6ReadAlpha();
+  try {
+    for(const alpha of ALPHA_GRID) {
+      hw6SetAlpha(alpha);
+      const report=await hw6RecallAsync('ppr',HW6_K,'val');
+      rows.push({alpha,recall:report.recall,cohortSize:report.cohort.length,error:null});
+      if(report.recall>bestRecall){bestRecall=report.recall;best=alpha;}
+    }
+  }finally{hw6SetAlpha(previous);}
+  HW6_STATE.alphaSweepRows=rows;HW6_STATE.alphaSweepNote='';
+  return {rows,best,note:''};
 }

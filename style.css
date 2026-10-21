@@ -472,3 +472,8 @@ output {
     height: 18rem;
   }
 }
+
+#action-status { position: sticky; bottom: 12px; z-index: 20; padding: 14px; background: #f0faf9; border: 2px solid #508b90; border-radius: 8px; color: #203d40; }
+#action-status[aria-busy="true"] { background: #fff5d6; }
+
+#action-status[aria-busy="true"] { position: fixed; bottom: 16px; left: 24px; right: 24px; max-width: 1000px; margin: 0 auto; box-shadow: 0 4px 24px #0002; }
